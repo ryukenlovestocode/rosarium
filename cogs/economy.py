@@ -14,19 +14,44 @@ Ownership:
   config.OWNER_IDS (set in .env) — no ID hardcoded in this file, and it
   automatically covers everyone listed as an owner, not just one person.
 
+Aesthetic pass:
+  Reskinned for Rosarium's rose/thorn identity instead of Luna's — the
+  slot reel that used to be a 🌙 is now a 🌹 jackpot, coinflip calls
+  "petal" and "thorn" instead of heads/tails, and the wheel/fish outcome
+  labels read like a garden rather than a generic casino floor.
+  config.EMBED_COLOR / EMBED_COLOR_DARK still drive every neutral embed
+  (balance, pay, daily, loading states) so this cog stays visually
+  consistent with the rest of the bot; the four *_COLOR constants below
+  exist only because config doesn't have enough granularity to
+  distinguish a win from a jackpot from a push, and are used for casino
+  outcomes only. Every embed goes through the local _embed() helper so
+  that isn't five repeated lines in every command.
+
+  Also fixed along the way:
+    - `pay` used to reuse the casino games' "Max bet is..." error text,
+      which read oddly for a plain transfer. It has its own message now.
+    - `leaderboard` said "the richest members of Rosarium" regardless of
+      which server it ran in. It names the actual server now.
+    - `addmoney` was missing the footer every other embed here has.
+    - The six cooldown-gated commands (coinflip, dice, spinwheel, fish,
+      slots, rob) now release your cooldown if your input was invalid
+      (bad bet, bad side, self-rob, etc.) instead of quietly burning it
+      on a typo. Payouts and odds are untouched — only the copy, colors,
+      and this one UX papercut changed.
+
 Commands:
-  balance [user]        — check your (or someone else's) balance
-  pay <user> <amount>    — send currency to another member
-  daily                  — claim a once-per-day reward (randomized amount)
-  leaderboard            — top 10 balances in the server
+  balance [user]           — check your (or someone else's) balance
+  pay <user> <amount>      — send currency to another member
+  daily                    — claim a once-per-day reward (randomized amount)
+  leaderboard              — top 10 balances in the server
   addmoney <amount> [user] — [owner only] grant currency, for testing
-  coinflip <amount> [h/t] — 50/50 coinflip, defaults to heads
-  dice <amount> <n1> <n2> — guess two numbers, roll two dice
-  spinwheel <amount>     — wheel of fortune with big win/loss multipliers
-  fish <amount>          — fish for a payout multiplier
-  slots <amount>         — 3-reel slot machine
-  rob <user>             — attempt to steal currency, risk of a fine
-  blackjack <amount>     — reaction-button blackjack (🟢 hit, 🛑 stand, ⚡ double down)
+  coinflip <amount> [petal/thorn] — 50/50 coinflip, defaults to petal (h/t still work)
+  dice <amount> <n1> <n2>  — guess two numbers, roll two dice
+  spinwheel <amount>       — wheel of fortune with big win/loss multipliers
+  fish <amount>            — fish for a payout multiplier
+  slots <amount>           — 3-reel slot machine
+  rob <user>               — attempt to steal currency, risk of a fine
+  blackjack <amount>       — reaction-button blackjack (🟢 hit, 🛑 stand, ⚡ double down)
 """
 
 import asyncio
@@ -45,11 +70,30 @@ from storage import JSONStore
 # ---------- CONSTANTS ----------
 
 MAX_BET: Final = 250_000
+CASINO_MAX_BET: Final = 100_000  # lower ceiling for wheel / fish / slots
 DAILY_MIN: Final = 5_000
 DAILY_MAX: Final = 15_000
 DAILY_COOLDOWN: Final = datetime.timedelta(hours=24)
 
 CURRENCY: Final = "petals"
+
+# ---------- OUTCOME PALETTE ----------
+# config.py only exposes one brand color and one darker variant, which
+# isn't enough granularity for casino results to read at a glance. These
+# four are local to this cog and used ONLY for win/loss/jackpot/push
+# outcomes — every other embed here still uses config.EMBED_COLOR /
+# config.EMBED_COLOR_DARK, same as the rest of the bot.
+WIN_COLOR: Final = 0xD4A24E       # a win — warm gold
+JACKPOT_COLOR: Final = 0xE8B023   # the best possible outcome in a given game
+LOSS_COLOR: Final = 0x5C1A2E      # a loss — deep wine
+PUSH_COLOR: Final = 0x4A4E57      # a tie / partial win / "nothing happened"
+
+ROB_MIN_VICTIM_BALANCE: Final = 500    # victim needs at least this much to be worth robbing
+ROB_MIN_ROBBER_BALANCE: Final = 1_000  # you need at least this much to attempt it
+ROB_SUCCESS_RATE: Final = 0.20         # 20% chance of a clean theft
+ROB_MAX_STOLEN: Final = 5_000          # hard cap on a single theft
+ROB_FINE_MIN: Final = 500
+ROB_FINE_MAX: Final = 2_000
 
 CARD_VALUES: Final[dict[str, int]] = {
     "A": 11,
@@ -59,34 +103,37 @@ CARD_VALUES: Final[dict[str, int]] = {
 }
 CARDS: Final = list(CARD_VALUES.keys())
 
-# Wheel outcomes: (label, multiplier)
+# Wheel outcomes: (label, multiplier) — multipliers unchanged from before,
+# only the flavor text was reskinned.
 WHEEL_OUTCOMES: Final = [
-    ("Total disaster!", -4),
-    ("Bad spin", -2),
-    ("Weak spin", -1),
-    ("Lucky spin!", 1),
-    ("Great spin!", 2),
-    ("JACKPOT!", 4),
+    ("Thorns bite deep.", -4),
+    ("A withering spin.", -2),
+    ("A weak turn.", -1),
+    ("A lucky bloom.", 1),
+    ("A brilliant bloom!", 2),
+    ("FULL BLOOM — JACKPOT!", 4),
 ]
 
-# Fish outcomes: (label, multiplier)
+# Fish outcomes: (label, multiplier) — same deal, multipliers unchanged.
 FISH_OUTCOMES: Final = [
-    ("You fished up literal trash. x4 loss", -4),
-    ("A soggy boot. x2 loss", -2),
-    ("Small fish! x1 profit", 1),
-    ("Nice catch! x2 profit", 2),
-    ("BIG FISH! x3 profit", 3),
-    ("LEGENDARY CATCH! x4 profit", 4),
+    ("A waterlogged thorn branch. Nothing but trouble.", -4),
+    ("Just an old boot, tangled in reeds.", -2),
+    ("A small silver fish.", 1),
+    ("A fine catch!", 2),
+    ("A glimmering prize fish!", 3),
+    ("A LEGENDARY catch!", 4),
 ]
 
-# Slots symbols: (symbol, weight, multiplier)
+# Slots symbols: (symbol, weight, multiplier) — 🌙 (Luna's jackpot symbol)
+# is now 🌹; 🔔 is now 🕯️ to match the confession-candle motif already
+# used in fun.py. Weights and multipliers are untouched.
 SLOTS_REELS: Final = [
     ("🍋", 30, 1.5),
     ("🍒", 25, 2),
-    ("🔔", 20, 2.5),
+    ("🕯️", 20, 2.5),
     ("⭐", 15, 3),
     ("💎", 7, 5),
-    ("🌙", 3, 10),
+    ("🌹", 3, 10),
 ]
 
 DATA_PATH = os.path.join(os.path.dirname(__file__), "data", "economy.json")
@@ -120,10 +167,11 @@ def validate_bet(amount: int, balance: int, max_bet: int = MAX_BET) -> str | Non
     return None
 
 
-def balance_bar(balance: int, max_display: int = 250_000) -> str:
-    """Visual balance bar for embeds."""
+def _petal_bar(balance: int, max_display: int = 250_000) -> str:
+    """Visual balance bar for embeds. Renamed from balance_bar and
+    reskinned from 🟣⬛ to 🌹🖤 — same 10-segment shape, rose palette."""
     filled = min(10, round((balance / max_display) * 10))
-    return "🟣" * filled + "⬛" * (10 - filled)
+    return "🌹" * filled + "🖤" * (10 - filled)
 
 
 def spin_slots() -> tuple[list[str], float]:
@@ -143,6 +191,32 @@ def spin_slots() -> tuple[list[str], float]:
         return result, 0.5  # partial match
     else:
         return result, 0.0  # loss
+
+
+def _embed(
+    title: str,
+    color: int,
+    *,
+    description: str | None = None,
+    fields: list[tuple[str, str, bool]] | None = None,
+    thumbnail: str | None = None,
+    footer_extra: str | None = None,
+) -> discord.Embed:
+    """Shared embed builder for this cog — keeps title/fields/thumbnail/
+    footer construction in one place instead of repeating the same five
+    lines in every command below. footer_extra appends context (e.g.
+    blackjack's control hints) after the standard brand footer."""
+    embed = discord.Embed(title=title, color=color)
+    if description:
+        embed.description = description
+    for name, value, inline in fields or []:
+        embed.add_field(name=name, value=value, inline=inline)
+    if thumbnail:
+        embed.set_thumbnail(url=thumbnail)
+    embed.set_footer(
+        text=f"{config.FOOTER_TEXT} · {footer_extra}" if footer_extra else config.FOOTER_TEXT
+    )
+    return embed
 
 
 # ---------- COG ----------
@@ -196,19 +270,16 @@ class Economy(commands.Cog):
         user = member or ctx.author
         bal = self.get_balance(user.id)
 
-        embed = discord.Embed(
-            title="Wallet",
-            color=config.EMBED_COLOR,
+        embed = _embed(
+            "🌹 Wallet",
+            config.EMBED_COLOR,
+            fields=[
+                ("User", user.mention, True),
+                ("Server", ctx.guild.name, True),
+                ("Balance", f"**{bal:,} {CURRENCY}**\n{_petal_bar(bal)}", False),
+            ],
+            thumbnail=user.display_avatar.url,
         )
-        embed.set_thumbnail(url=user.display_avatar.url)
-        embed.add_field(name="User", value=user.mention, inline=True)
-        embed.add_field(name="Server", value=ctx.guild.name, inline=True)
-        embed.add_field(
-            name="Balance",
-            value=f"**{bal:,} {CURRENCY}**\n{balance_bar(bal)}",
-            inline=False,
-        )
-        embed.set_footer(text=config.FOOTER_TEXT)
         await ctx.send(embed=embed)
 
     # ---------- PAY ----------
@@ -219,24 +290,26 @@ class Economy(commands.Cog):
             return await ctx.send("You can't send currency to bots.")
         if member.id == ctx.author.id:
             return await ctx.send("You can't pay yourself.")
+        if amount <= 0:
+            return await ctx.send("Enter a positive amount.")
 
         sender_bal = self.get_balance(ctx.author.id)
-        err = validate_bet(amount, sender_bal, max_bet=sender_bal)
-        if err:
-            return await ctx.send(err)
+        if amount > sender_bal:
+            return await ctx.send(f"You don't have enough {CURRENCY} to send that much.")
 
         self.set_balance(ctx.author.id, sender_bal - amount)
         self.set_balance(member.id, self.get_balance(member.id) + amount)
 
-        embed = discord.Embed(
-            title="Transfer",
-            color=config.EMBED_COLOR,
+        embed = _embed(
+            "🌹 Transfer",
+            config.EMBED_COLOR,
+            fields=[
+                ("From", ctx.author.mention, True),
+                ("To", member.mention, True),
+                ("Amount", f"**{amount:,} {CURRENCY}**", False),
+            ],
+            thumbnail=ctx.author.display_avatar.url,
         )
-        embed.add_field(name="From", value=ctx.author.mention, inline=True)
-        embed.add_field(name="To", value=member.mention, inline=True)
-        embed.add_field(name="Amount", value=f"**{amount:,} {CURRENCY}**", inline=False)
-        embed.set_thumbnail(url=ctx.author.display_avatar.url)
-        embed.set_footer(text=config.FOOTER_TEXT)
         await ctx.send(embed=embed)
 
     # ---------- DAILY ----------
@@ -253,9 +326,10 @@ class Economy(commands.Cog):
             if remaining.total_seconds() > 0:
                 h, rem = divmod(int(remaining.total_seconds()), 3600)
                 m, _ = divmod(rem, 60)
-                embed = discord.Embed(
-                    description=f"Come back in **{h}h {m}m**.",
-                    color=config.EMBED_COLOR_DARK,
+                embed = _embed(
+                    "Still Blooming",
+                    config.EMBED_COLOR_DARK,
+                    description=f"Return in **{h}h {m}m** for your next bloom.",
                 )
                 return await ctx.send(embed=embed)
 
@@ -264,17 +338,13 @@ class Economy(commands.Cog):
         self.set_balance(user_id, new_bal)
         self.set_daily_claimed_now(user_id)
 
-        embed = discord.Embed(
-            title="Daily Reward",
-            description=f"**+{reward:,} {CURRENCY}** added to your wallet.",
-            color=config.EMBED_COLOR,
+        embed = _embed(
+            "🌹 Daily Bloom",
+            config.EMBED_COLOR,
+            description=f"**+{reward:,} {CURRENCY}** bloomed into your wallet.",
+            fields=[("New Balance", f"**{new_bal:,} {CURRENCY}**\n{_petal_bar(new_bal)}", False)],
+            thumbnail=ctx.author.display_avatar.url,
         )
-        embed.add_field(
-            name="New Balance",
-            value=f"**{new_bal:,} {CURRENCY}**\n{balance_bar(new_bal)}",
-            inline=False,
-        )
-        embed.set_footer(text=config.FOOTER_TEXT)
         await ctx.send(embed=embed)
 
     # ---------- ADD MONEY (OWNER) ----------
@@ -289,12 +359,12 @@ class Economy(commands.Cog):
         new_bal = self.get_balance(target.id) + amount
         self.set_balance(target.id, new_bal)
 
-        embed = discord.Embed(
-            title="Admin Grant",
+        embed = _embed(
+            "🔒 Admin Grant",
+            config.EMBED_COLOR,
             description=f"**+{amount:,} {CURRENCY}** → {target.mention}",
-            color=config.EMBED_COLOR,
+            fields=[("New Balance", f"**{new_bal:,} {CURRENCY}**\n{_petal_bar(new_bal)}", False)],
         )
-        embed.add_field(name="New Balance", value=f"**{new_bal:,}**", inline=False)
         await ctx.send(embed=embed)
 
     @addmoney.error
@@ -312,13 +382,7 @@ class Economy(commands.Cog):
         if not top:
             return await ctx.send("No data yet.")
 
-        embed = discord.Embed(
-            title="Leaderboard",
-            description="The richest members of Rosarium.",
-            color=config.EMBED_COLOR_DARK,
-        )
         medals = ["🥇", "🥈", "🥉"]
-
         lines = []
         rank = 0
         for uid, bal in top:
@@ -332,63 +396,65 @@ class Economy(commands.Cog):
         if not lines:
             return await ctx.send("No one on the leaderboard is currently in this server.")
 
-        embed.description += "\n\n" + "\n".join(lines)
-        embed.set_footer(text=config.FOOTER_TEXT)
+        embed = _embed(
+            "🌹 Leaderboard",
+            config.EMBED_COLOR_DARK,
+            description=f"The wealthiest members of **{ctx.guild.name}**, by petal count.\n\n"
+                        + "\n".join(lines),
+        )
         await ctx.send(embed=embed)
 
     # ---------- COINFLIP ----------
 
-    @commands.hybrid_command(aliases=["cf"], description=f"Bet some {CURRENCY} on a 50/50 coinflip.")
+    @commands.hybrid_command(aliases=["cf"], description=f"Bet some {CURRENCY} on a petal-or-thorn coinflip.")
     @commands.cooldown(1, 8, BucketType.user)
     async def coinflip(self, ctx: commands.Context, amount: int, side: str = "h"):
         user_id = ctx.author.id
         balance = self.get_balance(user_id)
-        side = side.lower()
+        side_input = side.lower().strip()
 
-        if side in ("h", "heads"):
+        if side_input in ("h", "heads", "petal", "p"):
             choice = "h"
-        elif side in ("t", "tails"):
+        elif side_input in ("t", "tails", "thorn", "th"):
             choice = "t"
         else:
-            return await ctx.send("Use `.coinflip <amount> h` or `.coinflip <amount> t`.")
+            ctx.command.reset_cooldown(ctx)
+            return await ctx.send(
+                f"Call `{ctx.clean_prefix}coinflip <amount> petal` or `thorn` — `h`/`t` still work too."
+            )
 
         err = validate_bet(amount, balance)
         if err:
+            ctx.command.reset_cooldown(ctx)
             return await ctx.send(err)
 
-        bet_label = "Heads" if choice == "h" else "Tails"
+        bet_label = "🌹 Petal" if choice == "h" else "🥀 Thorn"
 
-        embed = discord.Embed(
-            title="Flipping...",
-            description=f"You bet on **{bet_label}**",
-            color=config.EMBED_COLOR,
-        )
-        msg = await ctx.send(embed=embed)
+        msg = await ctx.send(embed=_embed(
+            "Flipping...",
+            config.EMBED_COLOR,
+            description=f"You call **{bet_label}**.",
+            thumbnail=ctx.author.display_avatar.url,
+        ))
         await asyncio.sleep(1.8)
 
         result = random.choice(("h", "t"))
-        landed = "Heads" if result == "h" else "Tails"
+        landed_label = "🌹 Petal" if result == "h" else "🥀 Thorn"
         won = choice == result
 
         new_bal = balance + amount if won else balance - amount
         self.set_balance(user_id, new_bal)
 
-        result_embed = discord.Embed(
-            title=f"{landed}!",
-            description=f"You bet on **{bet_label}**\n{'You **WON**!' if won else 'You **LOST**...'}",
-            color=config.EMBED_COLOR if won else config.EMBED_COLOR_DARK,
+        result_embed = _embed(
+            f"{landed_label}!",
+            WIN_COLOR if won else LOSS_COLOR,
+            description=f"You called **{bet_label}**.\n{'You **WON**!' if won else 'You **LOST**...'}",
+            fields=[
+                ("Outcome", f"{'+' if won else '-'}{amount:,} {CURRENCY}", True),
+                ("New Balance", f"**{new_bal:,}**", True),
+            ],
+            thumbnail=ctx.author.display_avatar.url,
         )
-        result_embed.add_field(
-            name="Change",
-            value=f"{'+' if won else '-'}{amount:,} {CURRENCY}",
-            inline=True,
-        )
-        result_embed.add_field(
-            name="Balance",
-            value=f"**{new_bal:,}**",
-            inline=True,
-        )
-        result_embed.set_footer(text=config.FOOTER_TEXT)
         await msg.edit(embed=result_embed)
 
     # ---------- DICE ----------
@@ -401,18 +467,21 @@ class Economy(commands.Cog):
 
         err = validate_bet(amount, balance)
         if err:
+            ctx.command.reset_cooldown(ctx)
             return await ctx.send(err)
         if n1 == n2:
+            ctx.command.reset_cooldown(ctx)
             return await ctx.send("The two guesses must be different.")
         if not (1 <= n1 <= 6 and 1 <= n2 <= 6):
+            ctx.command.reset_cooldown(ctx)
             return await ctx.send("Dice numbers must be between **1 and 6**.")
 
-        loading = discord.Embed(
-            title="Rolling...",
-            description="The dice tumble across the table.",
-            color=config.EMBED_COLOR,
-        )
-        msg = await ctx.send(embed=loading)
+        msg = await ctx.send(embed=_embed(
+            "Rolling...",
+            config.EMBED_COLOR,
+            description="The dice tumble through fallen petals.",
+            thumbnail=ctx.author.display_avatar.url,
+        ))
         await asyncio.sleep(1.8)
 
         guessed = {n1, n2}
@@ -422,26 +491,31 @@ class Economy(commands.Cog):
         if matches == 2:
             delta = amount * 2
             new_bal = balance + delta
-            title, color = "JACKPOT!", config.EMBED_COLOR
-            result = f"Both numbers matched!\n**+{delta:,} {CURRENCY}**"
+            title, color = "Full Bloom!", JACKPOT_COLOR
+            outcome = f"Both numbers matched!\n**+{delta:,} {CURRENCY}**"
         elif matches == 1:
             delta = amount
             new_bal = balance + delta
-            title, color = "You Won!", config.EMBED_COLOR
-            result = f"One number matched!\n**+{delta:,} {CURRENCY}**"
+            title, color = "A Petal Caught", WIN_COLOR
+            outcome = f"One number matched!\n**+{delta:,} {CURRENCY}**"
         else:
             new_bal = balance - amount
-            title, color = "You Lost", config.EMBED_COLOR_DARK
-            result = f"No matches.\n**-{amount:,} {CURRENCY}**"
+            title, color = "Thorned", LOSS_COLOR
+            outcome = f"No matches.\n**-{amount:,} {CURRENCY}**"
 
         self.set_balance(user_id, new_bal)
 
-        embed = discord.Embed(title=title, color=color)
-        embed.add_field(name="Rolled", value=f"**{rolled[0]} & {rolled[1]}**", inline=True)
-        embed.add_field(name="Guessed", value=f"**{n1} & {n2}**", inline=True)
-        embed.add_field(name="Result", value=result, inline=False)
-        embed.add_field(name="New Balance", value=f"`{new_bal:,} {CURRENCY}`", inline=False)
-        embed.set_footer(text=config.FOOTER_TEXT)
+        embed = _embed(
+            title,
+            color,
+            fields=[
+                ("Rolled", f"**{rolled[0]} & {rolled[1]}**", True),
+                ("Guessed", f"**{n1} & {n2}**", True),
+                ("Outcome", outcome, False),
+                ("New Balance", f"`{new_bal:,} {CURRENCY}`", False),
+            ],
+            thumbnail=ctx.author.display_avatar.url,
+        )
         await msg.edit(embed=embed)
 
     # ---------- SPIN WHEEL ----------
@@ -452,16 +526,17 @@ class Economy(commands.Cog):
         user_id = ctx.author.id
         balance = self.get_balance(user_id)
 
-        err = validate_bet(amount, balance, max_bet=100_000)
+        err = validate_bet(amount, balance, max_bet=CASINO_MAX_BET)
         if err:
+            ctx.command.reset_cooldown(ctx)
             return await ctx.send(err)
 
-        loading = discord.Embed(
-            title="Spinning the Wheel...",
-            description="The wheel spins.",
-            color=config.EMBED_COLOR,
-        )
-        msg = await ctx.send(embed=loading)
+        msg = await ctx.send(embed=_embed(
+            "Spinning the Wheel...",
+            config.EMBED_COLOR,
+            description="The wheel turns among the thorns.",
+            thumbnail=ctx.author.display_avatar.url,
+        ))
         await asyncio.sleep(2)
 
         label, multiplier = random.choice(WHEEL_OUTCOMES)
@@ -470,19 +545,20 @@ class Economy(commands.Cog):
         new_bal = balance + delta if won else balance - delta
         self.set_balance(user_id, new_bal)
 
-        embed = discord.Embed(
-            title="Spin Result",
+        best = max(m for _, m in WHEEL_OUTCOMES)
+        color = LOSS_COLOR if not won else (JACKPOT_COLOR if multiplier >= best else WIN_COLOR)
+
+        embed = _embed(
+            "The Wheel Stops",
+            color,
             description=label,
-            color=config.EMBED_COLOR if won else config.EMBED_COLOR_DARK,
+            fields=[
+                ("Bet", f"`{amount:,} {CURRENCY}`", True),
+                ("Outcome", f"{'+' if won else '-'}{delta:,} {CURRENCY}", True),
+                ("New Balance", f"`{new_bal:,} {CURRENCY}`", False),
+            ],
+            thumbnail=ctx.author.display_avatar.url,
         )
-        embed.add_field(name="Bet", value=f"`{amount:,} {CURRENCY}`", inline=True)
-        embed.add_field(
-            name="Outcome",
-            value=f"{'+' if won else '-'}{delta:,} {CURRENCY}",
-            inline=True,
-        )
-        embed.add_field(name="New Balance", value=f"`{new_bal:,} {CURRENCY}`", inline=False)
-        embed.set_footer(text=config.FOOTER_TEXT)
         await msg.edit(embed=embed)
 
     # ---------- FISH ----------
@@ -493,17 +569,18 @@ class Economy(commands.Cog):
         user_id = ctx.author.id
         balance = self.get_balance(user_id)
 
-        err = validate_bet(amount, balance, max_bet=100_000)
+        err = validate_bet(amount, balance, max_bet=CASINO_MAX_BET)
         if err:
+            ctx.command.reset_cooldown(ctx)
             return await ctx.send(err)
 
-        loading = discord.Embed(
-            title="Fishing...",
-            description="Casting your line into the water.",
-            color=config.EMBED_COLOR,
-        )
-        loading.set_footer(text="Will you catch treasure or trash?")
-        msg = await ctx.send(embed=loading)
+        msg = await ctx.send(embed=_embed(
+            "Fishing...",
+            config.EMBED_COLOR,
+            description="A line drops into still water.",
+            thumbnail=ctx.author.display_avatar.url,
+            footer_extra="Will you catch treasure or trash?",
+        ))
         await asyncio.sleep(2)
 
         label, multiplier = random.choice(FISH_OUTCOMES)
@@ -512,19 +589,20 @@ class Economy(commands.Cog):
         new_bal = balance + delta if won else balance - delta
         self.set_balance(user_id, new_bal)
 
-        embed = discord.Embed(
-            title="Fishing Result",
+        best = max(m for _, m in FISH_OUTCOMES)
+        color = LOSS_COLOR if not won else (JACKPOT_COLOR if multiplier >= best else WIN_COLOR)
+
+        embed = _embed(
+            "Reeling It In",
+            color,
             description=label,
-            color=config.EMBED_COLOR if won else config.EMBED_COLOR_DARK,
+            fields=[
+                ("Bet", f"`{amount:,} {CURRENCY}`", True),
+                ("Outcome", f"{'+' if won else '-'}{delta:,} {CURRENCY}", True),
+                ("New Balance", f"`{new_bal:,} {CURRENCY}`", False),
+            ],
+            thumbnail=ctx.author.display_avatar.url,
         )
-        embed.add_field(name="Bet", value=f"`{amount:,} {CURRENCY}`", inline=True)
-        embed.add_field(
-            name="Outcome",
-            value=f"{'+' if won else '-'}{delta:,} {CURRENCY}",
-            inline=True,
-        )
-        embed.add_field(name="New Balance", value=f"`{new_bal:,} {CURRENCY}`", inline=False)
-        embed.set_footer(text=config.FOOTER_TEXT)
         await msg.edit(embed=embed)
 
     # ---------- SLOTS ----------
@@ -535,46 +613,52 @@ class Economy(commands.Cog):
         user_id = ctx.author.id
         balance = self.get_balance(user_id)
 
-        err = validate_bet(amount, balance, max_bet=100_000)
+        err = validate_bet(amount, balance, max_bet=CASINO_MAX_BET)
         if err:
+            ctx.command.reset_cooldown(ctx)
             return await ctx.send(err)
 
-        loading = discord.Embed(
-            title="Spinning Slots...",
-            description="| ❓ ❓ ❓ |",
-            color=config.EMBED_COLOR,
-        )
-        msg = await ctx.send(embed=loading)
+        msg = await ctx.send(embed=_embed(
+            "Spinning Slots...",
+            config.EMBED_COLOR,
+            description="🕯️ ❓ ❓ ❓ 🕯️",
+            thumbnail=ctx.author.display_avatar.url,
+        ))
         await asyncio.sleep(2)
 
         reels, multiplier = spin_slots()
-        display = " | ".join(reels)
+        display = f"🕯️ {' | '.join(reels)} 🕯️"
 
         won = multiplier > 0
         if won:
             delta = int(amount * multiplier)
             new_bal = balance + delta
             if multiplier >= 5:
-                title, color = "MOONSHOT JACKPOT!", config.EMBED_COLOR
+                title, color = "🌹 FULL BLOOM — JACKPOT!", JACKPOT_COLOR
             elif multiplier >= 3:
-                title, color = "Big Win!", config.EMBED_COLOR
+                title, color = "A Brilliant Pull!", WIN_COLOR
             elif multiplier == 0.5:
-                title, color = "Partial Match", config.EMBED_COLOR_DARK
+                title, color = "A Partial Bloom", PUSH_COLOR
             else:
-                title, color = "You Won!", config.EMBED_COLOR
+                title, color = "A Small Bloom", WIN_COLOR
             outcome = f"**+{delta:,} {CURRENCY}**"
         else:
             new_bal = balance - amount
-            title, color = "No Match", config.EMBED_COLOR_DARK
+            title, color = "Withered", LOSS_COLOR
             outcome = f"**-{amount:,} {CURRENCY}**"
 
         self.set_balance(user_id, new_bal)
 
-        embed = discord.Embed(title=title, color=color)
-        embed.add_field(name="Reels", value=f"**{display}**", inline=False)
-        embed.add_field(name="Outcome", value=outcome, inline=True)
-        embed.add_field(name="New Balance", value=f"`{new_bal:,} {CURRENCY}`", inline=True)
-        embed.set_footer(text=config.FOOTER_TEXT)
+        embed = _embed(
+            title,
+            color,
+            fields=[
+                ("Reels", f"**{display}**", False),
+                ("Outcome", outcome, True),
+                ("New Balance", f"`{new_bal:,} {CURRENCY}`", True),
+            ],
+            thumbnail=ctx.author.display_avatar.url,
+        )
         await msg.edit(embed=embed)
 
     # ---------- ROB ----------
@@ -583,42 +667,48 @@ class Economy(commands.Cog):
     @commands.cooldown(1, 60, BucketType.user)
     async def rob(self, ctx: commands.Context, target: discord.Member):
         if target.bot:
+            ctx.command.reset_cooldown(ctx)
             return await ctx.send("You can't rob a bot.")
         if target.id == ctx.author.id:
+            ctx.command.reset_cooldown(ctx)
             return await ctx.send("You can't rob yourself.")
 
         robber_bal = self.get_balance(ctx.author.id)
         victim_bal = self.get_balance(target.id)
 
-        if victim_bal < 500:
+        if victim_bal < ROB_MIN_VICTIM_BALANCE:
+            ctx.command.reset_cooldown(ctx)
             return await ctx.send(f"{target.mention} is too broke to rob.")
-        if robber_bal < 1000:
-            return await ctx.send("You need at least **1,000** to attempt a robbery.")
+        if robber_bal < ROB_MIN_ROBBER_BALANCE:
+            ctx.command.reset_cooldown(ctx)
+            return await ctx.send(f"You need at least **{ROB_MIN_ROBBER_BALANCE:,}** to attempt a robbery.")
 
-        success = random.random() < 0.2  # 20% success rate
-        stolen = random.randint(100, min(5000, victim_bal // 4))
-        fine = random.randint(500, 2000)
+        success = random.random() < ROB_SUCCESS_RATE
+        stolen = random.randint(100, min(ROB_MAX_STOLEN, victim_bal // 4))  # up to 25% of their balance
+        fine = random.randint(ROB_FINE_MIN, ROB_FINE_MAX)
 
         if success:
-            self.set_balance(ctx.author.id, robber_bal + stolen)
+            new_robber_bal = robber_bal + stolen
+            self.set_balance(ctx.author.id, new_robber_bal)
             self.set_balance(target.id, victim_bal - stolen)
-            embed = discord.Embed(
-                title="Robbery Successful!",
+            embed = _embed(
+                "A Clean Theft",
+                WIN_COLOR,
                 description=f"You slipped away with **{stolen:,} {CURRENCY}** from {target.mention}.",
-                color=config.EMBED_COLOR,
+                fields=[("New Balance", f"`{new_robber_bal:,}`", True)],
+                thumbnail=ctx.author.display_avatar.url,
             )
-            embed.add_field(name="Your Balance", value=f"`{robber_bal + stolen:,}`", inline=True)
         else:
             new_robber_bal = max(0, robber_bal - fine)
             self.set_balance(ctx.author.id, new_robber_bal)
-            embed = discord.Embed(
-                title="Caught!",
+            embed = _embed(
+                "Caught Among the Thorns",
+                LOSS_COLOR,
                 description=f"You got caught trying to rob {target.mention} and paid a **{fine:,} {CURRENCY}** fine.",
-                color=config.EMBED_COLOR_DARK,
+                fields=[("New Balance", f"`{new_robber_bal:,}`", True)],
+                thumbnail=ctx.author.display_avatar.url,
             )
-            embed.add_field(name="Your Balance", value=f"`{new_robber_bal:,}`", inline=True)
 
-        embed.set_footer(text=config.FOOTER_TEXT)
         await ctx.send(embed=embed)
 
     # ---------- BLACKJACK ----------
@@ -638,23 +728,17 @@ class Economy(commands.Cog):
         dealer = random.sample(CARDS, 2)
         pval = hand_value(player)
 
-        embed = discord.Embed(title="Blackjack", color=config.EMBED_COLOR)
-        embed.add_field(
-            name="Your Hand",
-            value=f"`{' '.join(player)}` → **{pval}**",
-            inline=False,
+        embed = _embed(
+            "🃏 Blackjack",
+            config.EMBED_COLOR,
+            fields=[
+                ("Your Hand", f"`{' '.join(player)}` → **{pval}**", False),
+                ("Dealer", f"`{dealer[0]}` ❓", False),
+                ("Bet", f"`{amount:,} {CURRENCY}`", False),
+            ],
+            thumbnail=ctx.author.display_avatar.url,
+            footer_extra="🟢 Hit  🛑 Stand  ⚡ Double Down",
         )
-        embed.add_field(
-            name="Dealer",
-            value=f"`{dealer[0]}` ❓",
-            inline=False,
-        )
-        embed.add_field(
-            name="Bet",
-            value=f"`{amount:,} {CURRENCY}`",
-            inline=False,
-        )
-        embed.set_footer(text="🟢 Hit  |  🛑 Stand  |  ⚡ Double Down")
 
         msg = await ctx.send(embed=embed)
         await msg.add_reaction("🟢")
@@ -742,42 +826,41 @@ class Economy(commands.Cog):
 
         if p > 21:
             new_bal = balance - bet
-            title, color = "Bust!", config.EMBED_COLOR_DARK
-            result = f"**-{bet:,} {CURRENCY}**"
+            title, color = "Bust — Thorned", LOSS_COLOR
+            outcome = f"**-{bet:,} {CURRENCY}**"
         elif natural_bj and d != 21:
             payout = int(bet * 1.5)
             new_bal = balance + payout
-            title, color = "Blackjack! Natural 21!", config.EMBED_COLOR
-            result = f"**+{payout:,} {CURRENCY}** (1.5x)"
+            title, color = "🌹 Natural Blackjack!", JACKPOT_COLOR
+            outcome = f"**+{payout:,} {CURRENCY}** (1.5x)"
         elif d > 21 or p > d:
             new_bal = balance + bet
-            title, color = "You Win!", config.EMBED_COLOR
-            result = f"**+{bet:,} {CURRENCY}**"
+            title, color = "You Win!", WIN_COLOR
+            outcome = f"**+{bet:,} {CURRENCY}**"
         elif p == d:
             new_bal = balance
-            title, color = "Push — Tie", config.EMBED_COLOR_DARK
-            result = "Bet returned."
+            title, color = "Push — Even Trade", PUSH_COLOR
+            outcome = "Bet returned."
         else:
             new_bal = balance - bet
-            title, color = "Dealer Wins", config.EMBED_COLOR_DARK
-            result = f"**-{bet:,} {CURRENCY}**"
+            title, color = "Dealer Wins", LOSS_COLOR
+            outcome = f"**-{bet:,} {CURRENCY}**"
 
         self.set_balance(user_id, new_bal)
 
-        embed = discord.Embed(title=title, color=color)
-        embed.add_field(
-            name="Your Hand",
-            value=f"`{' '.join(player)}` → **{p}**",
-            inline=True,
+        user_obj = self.bot.get_user(user_id)
+
+        embed = _embed(
+            title,
+            color,
+            fields=[
+                ("Your Hand", f"`{' '.join(player)}` → **{p}**", True),
+                ("Dealer Hand", f"`{' '.join(dealer)}` → **{d}**", True),
+                ("Outcome", outcome, False),
+                ("New Balance", f"`{new_bal:,} {CURRENCY}`", False),
+            ],
+            thumbnail=user_obj.display_avatar.url if user_obj else None,
         )
-        embed.add_field(
-            name="Dealer Hand",
-            value=f"`{' '.join(dealer)}` → **{d}**",
-            inline=True,
-        )
-        embed.add_field(name="Result", value=result, inline=False)
-        embed.add_field(name="New Balance", value=f"`{new_bal:,} {CURRENCY}`", inline=False)
-        embed.set_footer(text=config.FOOTER_TEXT)
         await message.edit(embed=embed)
 
 
